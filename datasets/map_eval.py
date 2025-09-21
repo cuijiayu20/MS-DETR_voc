@@ -1,5 +1,3 @@
-# datasets/map_eval.py
-
 import os
 import torch
 import shutil
@@ -7,9 +5,9 @@ import xml.etree.ElementTree as ET
 from tqdm import tqdm
 
 from util.misc import all_gather
-from util.utils_map import get_map
+from util.utils_map import get_map  # 导入我们刚刚复制的模块
 
-# 确保 MS-DETR 的类别顺序与您的数据一致
+# 确保这里的类别与您 datasets/foggy_driving.py 中的 VOC_CLASSES 完全一致
 VOC_CLASSES = (
     "person", "bicycle", "car", "motorbike", "bus"
 )
@@ -18,15 +16,17 @@ VOC_CLASSES = (
 class MapEvaluator:
     def __init__(self, dataset, output_dir, epoch):
         self.dataset = dataset
-        # 为每个 epoch 创建一个独立的评估文件夹
+        # 为每个 epoch 创建一个独立的评估文件夹，方便保存
         self.map_out_path = os.path.join(output_dir, f'map_out_epoch_{epoch}')
         self.predictions = []
 
     def update(self, predictions):
-        # predictions 是一个字典 {image_id: {'scores': tensor, 'labels': tensor, 'boxes': tensor}}
+        # predictions 的格式是 {coco_image_id: result_dict}
+        # result_dict 包含 'scores', 'labels', 'boxes'
         self.predictions.extend(predictions.items())
 
     def synchronize_between_processes(self):
+        # 在分布式训练中，从所有GPU收集预测结果
         all_preds = all_gather(self.predictions)
         merged_preds = []
         for p in all_preds:
@@ -34,7 +34,9 @@ class MapEvaluator:
         self.predictions = merged_preds
 
     def accumulate(self):
-        # 准备文件目录
+        # 这个方法负责将模型输出转换为 get_map.py 需要的 .txt 文件格式
+
+        # 1. 准备文件目录
         self.det_results_path = os.path.join(self.map_out_path, 'detection-results')
         self.gt_path = os.path.join(self.map_out_path, 'ground-truth')
 
@@ -43,11 +45,10 @@ class MapEvaluator:
         os.makedirs(self.det_results_path)
         os.makedirs(self.gt_path)
 
-        # 1. 生成预测文件
+        # 2. 生成预测文件 (detection-results)
         print("Generating prediction files for mAP...")
-        # self.predictions 是一个列表，元素为 (image_id_int, prediction_dict)
         for image_id_int, prediction in tqdm(self.predictions):
-            # 从 dataset.image_ids 中通过整数索引获取文件名
+            # 使用整数索引从数据集中获取不带后缀的文件名
             image_filename_no_ext = self.dataset.image_ids[image_id_int]
 
             with open(os.path.join(self.det_results_path, image_filename_no_ext + ".txt"), "w") as f:
@@ -56,7 +57,7 @@ class MapEvaluator:
                     left, top, right, bottom = box.cpu().numpy()
                     f.write(f"{class_name} {score.item()} {int(left)} {int(top)} {int(right)} {int(bottom)}\n")
 
-        # 2. 生成 GT 文件
+        # 3. 生成真实标签文件 (ground-truth)
         print("Generating ground truth files for mAP...")
         ann_folder = self.dataset.ann_folder  # 从数据集中获取标注文件夹路径
         for image_id in tqdm(self.dataset.image_ids):
@@ -87,8 +88,10 @@ class MapEvaluator:
 
     def summarize(self):
         print(f"Calculating mAP for epoch, results in: {self.map_out_path}")
-        # 注意: get_map 会将结果打印到控制台，并返回一个字典
-        results = get_map(min_overlap=0.5, draw_plot=True, path=self.map_out_path)
+        # --- 修复 ---
+        # 根据您提供的函数定义 def get_map(MINOVERLAP, draw_plot, path) 进行调用
+        results = get_map(0.5, True, path=self.map_out_path)
+        # --- 修复结束 ---
 
         # 我们只关心 mAP
         mAP = results['mAP']
@@ -97,6 +100,7 @@ class MapEvaluator:
 
         # 在主进程中打印 mAP
         if int(os.environ.get("RANK", 0)) == 0:
-            print(f"mAP@0.5: {mAP}")
+            print(f"mAP@0.5 IoU: {mAP}")
 
         return stats
+

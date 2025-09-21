@@ -1,18 +1,14 @@
-# datasets/foggy_driving.py
-
 import os
 import torch
 import torch.utils.data
-import torchvision
 from PIL import Image
 import xml.etree.ElementTree as ET
+from pathlib import Path
 
 from util.misc import get_local_rank, get_local_size
 import datasets.transforms as T
-from pathlib import Path
 
-# 类别名称 -> 类别ID 的映射
-# !!! 固定为您的5个类别 !!!
+# 类别名称 -> 类别ID 的映射 (固定为您的5个类别)
 VOC_CLASSES = (
     "person", "bicycle", "car", "motorbike", "bus"
 )
@@ -26,13 +22,13 @@ def get_class_map():
 class FoggyDrivingDetection(torch.utils.data.Dataset):
     def __init__(self, img_folder, ann_folder, image_set_file, transforms, return_masks):
         self.img_folder = Path(img_folder)
-        self.ann_folder = Path(ann_folder)  # <--- 确保这行存在
+        self.ann_folder = Path(ann_folder)
         self._transforms = transforms
         self.return_masks = return_masks
         self.class_to_ind = get_class_map()
 
         with open(image_set_file, "r") as f:
-            self.image_ids = [line.strip() for line in f.readlines()]  # <--- 确保这行存在
+            self.image_ids = [line.strip() for line in f.readlines()]
 
         self.ids = list(range(len(self.image_ids)))
 
@@ -42,8 +38,19 @@ class FoggyDrivingDetection(torch.utils.data.Dataset):
         ann_path = self.ann_folder / f"{image_id}.xml"
         target = self.parse_voc_xml(ET.parse(ann_path).getroot())
 
-        img_path = self.img_folder / f"{image_id}.jpg"
+        # --- 修复：动态检查图片后缀 ---
+        img_path_jpg = self.img_folder / f"{image_id}.jpg"
+        img_path_png = self.img_folder / f"{image_id}.png"
+
+        if img_path_jpg.exists():
+            img_path = img_path_jpg
+        elif img_path_png.exists():
+            img_path = img_path_png
+        else:
+            raise FileNotFoundError(f"Image not found for {image_id} with .jpg or .png extension in {self.img_folder}")
+
         img = Image.open(img_path).convert('RGB')
+        # --- 修复结束 ---
 
         target['image_id'] = torch.tensor([idx])
 
@@ -69,11 +76,11 @@ class FoggyDrivingDetection(torch.utils.data.Dataset):
             if obj_name not in self.class_to_ind:
                 continue
 
-            bbox = obj.find('bndbox')
-            xmin = float(bbox.find('xmin').text) - 1
-            ymin = float(bbox.find('ymin').text) - 1
-            xmax = float(bbox.find('xmax').text) - 1
-            ymax = float(bbox.find('ymax').text) - 1
+            bndbox = obj.find('bndbox')
+            xmin = float(bndbox.find('xmin').text) - 1
+            ymin = float(bndbox.find('ymin').text) - 1
+            xmax = float(bndbox.find('xmax').text) - 1
+            ymax = float(bndbox.find('ymax').text) - 1
             boxes.append([xmin, ymin, xmax, ymax])
             gt_classes.append(self.class_to_ind[obj_name])
 
@@ -119,35 +126,36 @@ def make_foggy_driving_transforms(image_set):
 
 
 def build(image_set, args):
+    # --- 修复：调整路径以匹配 "data" 子文件夹 ---
     if image_set == 'train':
-        root_dir = Path('./voc-fog/train')
+        root_dir = Path('./data/voc-fog/train')
         dataset_name = args.train_dataset
         image_set_file = root_dir / 'ImageSets' / 'Main' / 'train.txt'
+        ann_folder = root_dir / 'Annotations'
+        img_folder = root_dir / dataset_name
     elif image_set == 'val':
-        root_dir = Path('./voc-fog/test')
         dataset_name = args.val_dataset
-        image_set_file = root_dir / 'ImageSets' / 'Main' / 'val.txt'
-    else:
-        # Handling independent test sets
-        if args.test_dataset == 'Foggy_Driving_voc':
-            img_folder = './Foggy_Driving_voc/JPEGImages'
-            ann_folder = './Foggy_Driving_voc/Annotations'
-            image_set_file = './Foggy_Driving_voc/ImageSets/Main/test.txt'  # Assume you have a test.txt
-        elif args.test_dataset == 'RTTStest':
-            img_folder = './RTTStest/Images'
-            ann_folder = './RTTStest/Annotations'
-            image_set_file = './RTTStest/ImageSets/Main/test.txt'  # Assume you have a test.txt
+
+        if dataset_name in ['VOCtest-FOG', 'RainyImages', 'SnowyImages']:
+            root_dir = Path('./data/voc-fog/test')
+            image_set_file = root_dir / 'ImageSets' / 'Main' / 'val.txt'
+            ann_folder = root_dir / 'Annotations'
+            img_folder = root_dir / dataset_name
+        elif dataset_name == 'Foggy_Driving_voc':
+            root_dir = Path('./data/Foggy_Driving_voc')
+            image_set_file = root_dir / 'ImageSets' / 'Main' / 'val.txt'
+            ann_folder = root_dir / 'Annotations'
+            img_folder = root_dir / 'JPEGImages'
+        elif dataset_name == 'RTTStest':
+            root_dir = Path('./data/RTTStest')
+            image_set_file = root_dir / 'ImageSets' / 'Main' / 'val.txt'
+            ann_folder = root_dir / 'Annotations'
+            img_folder = root_dir / 'Images'
         else:
-            raise ValueError(f'unknown test_dataset {args.test_dataset}')
-
-        dataset = FoggyDrivingDetection(str(img_folder), str(ann_folder), str(image_set_file),
-                                        transforms=make_foggy_driving_transforms('test'),
-                                        return_masks=args.masks)
-        return dataset
-
-    # Construct paths for train/val sets
-    img_folder = root_dir / dataset_name
-    ann_folder = root_dir / 'Annotations'
+            raise ValueError(f'unknown val_dataset {dataset_name}')
+    else:
+        raise ValueError(f'unknown image_set {image_set}')
+    # --- 修复结束 ---
 
     dataset = FoggyDrivingDetection(str(img_folder), str(ann_folder), str(image_set_file),
                                     transforms=make_foggy_driving_transforms(image_set),

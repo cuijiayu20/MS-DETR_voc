@@ -232,7 +232,7 @@ def draw_plot_func(dictionary, n_classes, window_title, plot_title, x_label, out
             if i == (len(sorted_values)-1): # largest bar
                 adjust_axes(r, t, fig, axes)
     # set window title
-    fig.canvas.set_window_title(window_title)
+    #fig.canvas.set_window_title(window_title)
     # write classes in y axis
     tick_font_size = 12
     plt.yticks(range(n_classes), sorted_keys, fontsize=tick_font_size)
@@ -587,16 +587,17 @@ def get_map(MINOVERLAP, draw_plot, path = './map_out'):
             lamr_dictionary[class_name] = lamr
 
             if draw_plot:
-                plt.plot(rec, prec, '-o')
-                area_under_curve_x = mrec[:-1] + [mrec[-2]] + [mrec[-1]]
-                area_under_curve_y = mprec[:-1] + [0.0] + [mprec[-1]]
-                plt.fill_between(area_under_curve_x, 0, area_under_curve_y, alpha=0.2, edgecolor='r')
+                if draw_plot:
+                    plt.plot(rec, prec, '-o')
+                    area_under_curve_x = mrec[:-1] + [mrec[-2]] + [mrec[-1]]
+                    area_under_curve_y = mprec[:-1] + [0.0] + [mprec[-1]]
+                    plt.fill_between(area_under_curve_x, 0, area_under_curve_y, alpha=0.2, edgecolor='r')
 
-                fig = plt.gcf()
-                fig.canvas.set_window_title('AP ' + class_name)
+                    fig = plt.gcf()
+                    # fig.canvas.set_window_title('AP ' + class_name) # <--- 注释掉这一行
 
-                plt.title('class: ' + text)
-                plt.xlabel('Recall')
+                    plt.title('class: ' + text)
+                    plt.xlabel('Recall')
                 plt.ylabel('Precision')
                 axes = plt.gca()
                 axes.set_xlim([0.0,1.0])
@@ -780,6 +781,7 @@ def get_map(MINOVERLAP, draw_plot, path = './map_out'):
             plot_color,
             ""
             )
+    return {'mAP': mAP, 'AP_dict': ap_dictionary}
 
 def preprocess_gt(gt_path, class_names):
     image_ids   = os.listdir(gt_path)

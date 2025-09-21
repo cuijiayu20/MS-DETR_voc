@@ -147,6 +147,7 @@ def get_args_parser():
     parser.add_argument('--enc_giou_loss_coef', default=2, type=float)
     parser.add_argument('--topk_eval', default=100, type=int)
     parser.add_argument('--nms_iou_threshold', default=None, type=float)
+    parser.add_argument('--eval_every', default=1, type=int, help='Run evaluation every N epochs')
     return parser
 
 
@@ -173,29 +174,46 @@ def main(args):
     n_parameters = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print('number of params:', n_parameters)
 
-    dataset_train = build_dataset(image_set='train', args=args)
+    # ==============================================================================
+    # --- 修改开始: 动态加载数据集 ---
+    # ==============================================================================
+
     dataset_val = build_dataset(image_set='val', args=args)
 
     if args.distributed:
-        if args.cache_mode:
-            sampler_train = samplers.NodeDistributedSampler(dataset_train)
-            sampler_val = samplers.NodeDistributedSampler(dataset_val, shuffle=False)
-        else:
-            sampler_train = samplers.DistributedSampler(dataset_train)
-            sampler_val = samplers.DistributedSampler(dataset_val, shuffle=False)
+        sampler_val = samplers.DistributedSampler(dataset_val, shuffle=False)
     else:
-        sampler_train = torch.utils.data.RandomSampler(dataset_train)
         sampler_val = torch.utils.data.SequentialSampler(dataset_val)
 
-    batch_sampler_train = torch.utils.data.BatchSampler(
-        sampler_train, args.batch_size, drop_last=True)
-
-    data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
-                                   collate_fn=utils.collate_fn, num_workers=args.num_workers,
-                                   pin_memory=True)
     data_loader_val = DataLoader(dataset_val, args.batch_size, sampler=sampler_val,
                                  drop_last=False, collate_fn=utils.collate_fn, num_workers=args.num_workers,
                                  pin_memory=True)
+
+    # 初始化训练相关的变量为 None
+    data_loader_train = None
+    sampler_train = None
+
+    # 仅在非评估模式下才加载训练集
+    if not args.eval:
+        dataset_train = build_dataset(image_set='train', args=args)
+        if args.distributed:
+            if args.cache_mode:
+                sampler_train = samplers.NodeDistributedSampler(dataset_train)
+            else:
+                sampler_train = samplers.DistributedSampler(dataset_train)
+        else:
+            sampler_train = torch.utils.data.RandomSampler(dataset_train)
+
+        batch_sampler_train = torch.utils.data.BatchSampler(
+            sampler_train, args.batch_size, drop_last=True)
+
+        data_loader_train = DataLoader(dataset_train, batch_sampler=batch_sampler_train,
+                                       collate_fn=utils.collate_fn, num_workers=args.num_workers,
+                                       pin_memory=True)
+
+    # ==============================================================================
+    # --- 修改结束 ---
+    # ==============================================================================
 
     def match_name_keywords(n, name_keywords):
         out = False
@@ -244,27 +262,24 @@ def main(args):
                 args.resume, map_location='cpu', check_hash=True)
         else:
             checkpoint = torch.load(args.resume, map_location='cpu')
-        missing_keys, unexpected_keys = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
-        unexpected_keys = [k for k in unexpected_keys if not (k.endswith('total_params') or k.endswith('total_ops'))]
-        if len(missing_keys) > 0:
-            print('Missing Keys: {}'.format(missing_keys))
-        if len(unexpected_keys) > 0:
-            print('Unexpected Keys: {}'.format(unexpected_keys))
-        if not args.eval and 'optimizer' in checkpoint and 'lr_scheduler' in checkpoint and 'epoch' in checkpoint:
-            import copy
-            p_groups = copy.deepcopy(optimizer.param_groups)
-            optimizer.load_state_dict(checkpoint['optimizer'])
-            for pg, pg_old in zip(optimizer.param_groups, p_groups):
-                pg['lr'] = pg_old['lr']
-                pg['initial_lr'] = pg_old['initial_lr']
-            lr_scheduler.load_state_dict(checkpoint['lr_scheduler'])
-            args.override_resumed_lr_drop = True
-            if args.override_resumed_lr_drop:
-                print('Warning: (hack) args.override_resumed_lr_drop is set to True, so args.lr_drop would override lr_drop in resumed lr_scheduler.')
-                lr_scheduler.step_size = args.lr_drop
-                lr_scheduler.base_lrs = list(map(lambda group: group['initial_lr'], optimizer.param_groups))
-            lr_scheduler.step(lr_scheduler.last_epoch)
-            args.start_epoch = checkpoint['epoch'] + 1
+
+        # --- FIX FOR FINETUNING WITH DIFFERENT NUMBER OF CLASSES ---
+        checkpoint_model = checkpoint['model']
+        # Get the state dict of the new model
+        model_dict = model_without_ddp.state_dict()
+
+        # 1. Filter out classification head keys from the pre-trained model
+        # We only keep weights that exist in the new model and do NOT contain "class_embed"
+        pretrained_dict = {k: v for k, v in checkpoint_model.items()
+                           if k in model_dict and "class_embed" not in k}
+
+        # 2. Overwrite the new model's state_dict with the filtered pre-trained weights
+        model_dict.update(pretrained_dict)
+
+        # 3. Load the updated state_dict into the new model
+        model_without_ddp.load_state_dict(model_dict)
+        print("Pretrained weights loaded successfully (classification heads ignored).")
+        # --- END OF FIX ---
 
     if args.eval:
         test_stats, _ = evaluate(model, criterion, postprocessors,
@@ -294,18 +309,19 @@ def main(args):
                     'args': args,
                 }, checkpoint_path)
 
-        test_stats, _ = evaluate(
-            model, criterion, postprocessors, data_loader_val, device, args.output_dir, epoch
-        )
+        if (epoch + 1) % args.eval_every == 0 or epoch == args.epochs - 1:
+            test_stats, map_evaluator = evaluate(
+                model, criterion, postprocessors, data_loader_val, device, args.output_dir, epoch
+            )
 
-        log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
-                     **{f'test_{k}': v for k, v in test_stats.items()},
-                     'epoch': epoch,
-                     'n_parameters': n_parameters}
+            log_stats = {**{f'train_{k}': v for k, v in train_stats.items()},
+                         **{f'test_{k}': v for k, v in test_stats.items()},
+                         'epoch': epoch,
+                         'n_parameters': n_parameters}
 
-        if args.output_dir and utils.is_main_process():
-            with (output_dir / "log.txt").open("a") as f:
-                f.write(json.dumps(log_stats) + "\n")
+            if args.output_dir and utils.is_main_process():
+                with (output_dir / "log.txt").open("a") as f:
+                    f.write(json.dumps(log_stats) + "\n")
 
     total_time = time.time() - start_time
     total_time_str = str(datetime.timedelta(seconds=int(total_time)))
